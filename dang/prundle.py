@@ -122,6 +122,20 @@ class FSPrundle(object):
 
     @classmethod
     def root_to_config(klass, root):
+        """ Get configuration from ``meta.ini`` fileobj in `root`
+
+        Parameters
+        ----------
+        root : filobj maker
+            object with ``open`` method
+
+        Returns
+        -------
+        pkg_name : str
+            package name
+        meta : dict
+            package metadata
+        """
         config = ConfigParser.SafeConfigParser()
         try:
             cfg_file = root.open('meta.ini', klass.default_text_mode)

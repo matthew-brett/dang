@@ -4,6 +4,7 @@
 from os.path import (split as psplit, join as pjoin, sep as filesep,
                      isdir, isfile)
 import re
+import urllib2
 import ConfigParser
 import zipfile
 
@@ -41,24 +42,39 @@ class FSPrundle(object):
     """
     default_binary_mode = 'rb'
     default_text_mode = 'rU'
+    root_maker = lambda x : x
 
     def __init__(self, pinstant, root):
         self.pinstant = pinstant
         self.root = root
 
     @classmethod
-    def croot_get_fileobj(klass, root, sub_path, mode=None):
-        """ Class method to return open fileobj from prundle
+    def uri_to_root(klass, uri):
+        """ Class method to return file-provider from `uri'
+
+        Parameters
+        ----------
+        uri : str
+
+        Returns
+        -------
+        root : file-provider
+            implments open(sub-path) method
         """
-        raise NotImplementedError
+        return klass.root_maker(uri,
+                                klass.default_binary_mode,
+                                klass.default_text_mode)
 
     def get_fileobj(self, sub_path, mode=None):
         """ Return open fileobj from prundle
         """
-        return self.__class__.croot_get_fileobj(
-            self.root,
-            sub_path,
-            self.default_binary_mode)
+        if mode is None:
+            mode = self.default_binary_mode
+        return self.root.open(sub_path, mode)
+
+    @classmethod
+    def from_path(klass, path, pkg_name=None, meta=None):
+        return klass.from_root(klass.uri_to_root(path), pkg_name, meta)
 
     @classmethod
     def from_root(klass, root, pkg_name=None, meta=None):
@@ -82,19 +98,19 @@ class FSPrundle(object):
         fsprd : klass instance
             instance of this `klass`
         """
-        read_name, read_meta = klass._read_cfg(root)
+        cfg_name, cfg_meta = klass.root_to_config(root)
         if pkg_name is None:
-            if read_name is None:
+            if cfg_name is None:
                 raise PrundleError('No read or passed package name')
-            pkg_name = read_name
-        elif pkg_name != read_name:
+            pkg_name = cfg_name
+        elif pkg_name != cfg_name:
             raise PrundleError('Read package name "%s" differs from passed '
-                               'package name "%s"' % (read_name,
+                               'package name "%s"' % (cfg_name,
                                                       pkg_name))
         if meta is None:
             meta = {}
         # Fill passed meta with read meta key, value pairs
-        for key, value in read_meta.items():
+        for key, value in cfg_meta.items():
             if not key in meta:
                 meta[key] = value
             else: # keys in both, check they are the same
@@ -105,12 +121,10 @@ class FSPrundle(object):
         return klass(Pinstant(pkg_name, meta), root)
 
     @classmethod
-    def _read_cfg(klass, root):
+    def root_to_config(klass, root):
         config = ConfigParser.SafeConfigParser()
         try:
-            cfg_file = klass.croot_get_fileobj(root,
-                                               'meta.ini',
-                                               klass.default_text_mode)
+            cfg_file = root.open('meta.ini', klass.default_text_mode)
         except IOError:
             pass
         else:
@@ -121,29 +135,103 @@ class FSPrundle(object):
         return pkg_name, meta
 
 
+def common_zip_path(file_list):
+    """ Return root directory common to all zip file paths
+
+    Parameters
+    ----------
+    file_list : sequence
+        list of files in zip archive
+
+    Returns
+    -------
+    common_path : str
+        shortest string at the start of all entries in `file_list` that ends
+        with a ``/``.  None if there is no such component
+    """
+    components0 = file_list[0].split('/', 1)
+    if len(components0) == 1:
+        return None
+    to_test = components0[0] + '/'
+    for e in file_list[1:]:
+        if not e.startswith(to_test):
+            return None
+    return to_test
+
+
+class ZipRoot(object):
+    def __init__(self,
+                 path,
+                 default_binary_mode='r',
+                 default_text_mode='rU'):
+        self.zipobj = zipfile.ZipFile(path)
+        self.common_path = common_zip_path(self.zipobj.namelist())
+        self.default_binary_mode = default_binary_mode
+        self.default_text_mode = default_text_mode
+
+    def open(self, sub_path, mode=None):
+        if mode is None:
+            mode = self.default_binary_mode
+        if not self.common_path is None:
+            sub_path = self.common_path + sub_path
+        return self.zipobj.open(sub_path, mode)
+
+
 class ZipPrundle(FSPrundle):
     default_binary_mode = 'r'
     default_text_mode = 'rU'
+    root_maker = ZipRoot
 
-    @classmethod
-    def croot_get_fileobj(klass, root, sub_path, mode=None):
-        """ Class method to return open fileobj from prundle
-        """
+
+class PathRoot(object):
+    def __init__(self,
+                 base_path,
+                 default_binary_mode='rb',
+                 default_text_mode='rU'):
+        self.base_path = base_path
+        self.default_binary_mode = default_binary_mode
+        self.default_text_mode = default_text_mode
+
+    def open(self, sub_path, mode=None):
         if mode is None:
-            mode = klass.default_binary_mode
-        return root.open(sub_path, mode)
+            mode = self.default_binary_mode
+        if filesep != "/":
+            sub_path = sub_path.replace('/', filesep)
+        return open(pjoin(self.base_path, sub_path), mode=mode)
 
 
 class PathPrundle(FSPrundle):
-    @classmethod
-    def croot_get_fileobj(klass, root, sub_path, mode=None):
-        """ Class method to return open fileobj from prundle
-        """
-        if mode is None:
-            mode = klass.default_binary_mode
-        if filesep != "/":
-            sub_path = sub_path.replace('/', filesep)
-        return open(pjoin(root, sub_path), mode=mode)
+    root_maker = PathRoot
+
+    def __init__(self, pinstant, root):
+        self.pinstant = pinstant
+        self.root = root
+        self.base_path = self.root.base_path
+
+
+class UrlRoot(object):
+    def __init__(self,
+                 base_url,
+                 default_binary_mode=None,
+                 default_text_mode=None):
+        self.base_url = base_url
+
+    def open(self, sub_path, mode=None):
+        if not mode is None:
+            if not 'r' in mode or 't' in mode:
+                raise ValueError('No flexible modes for urls')
+        return urllib2.urlopen(self.base_url + '/' + sub_path)
+
+
+class UrlPathPrundle(FSPrundle):
+    default_binary_mode = 'r'
+    default_text_mode = 'r'
+    root_maker = UrlRoot
+
+    def __init__(self, pinstant, root):
+        self.pinstant = pinstant
+        self.root = root
+        self.base_url = self.root.base_url
 
 
 URI_REG = re.compile(r'(http|file|ftp)://(.*)')
@@ -178,7 +266,7 @@ def make_prundle(uri, pkg_name=None, meta=None):
 
     >>> fsprd.pinstant.pkg_name
     'example-package'
-    >>> fsprd.root == fsp_path
+    >>> fsprd.base_path == fsp_path
     True
 
     If the read metadata conflicts with the passed metadata, generate an error:
@@ -198,14 +286,14 @@ def make_prundle(uri, pkg_name=None, meta=None):
     """
     uri_match = URI_REG.match(uri)
     if not uri_match is None:
-        PrundleError("Can't deal with this right now")
+        return UrlPathPrundle.from_path(uri, pkg_name, meta)
+    # Assume it's a filename
     pth, ext = psplit(uri)
-    if ext in ('tar', '.tar', '.gz', '.bz2'):
+    if ext in ('tar', '.tar', '.tgz', '.bz2'):
         PrundleError("Can't deal with this right now")
     if uri.endswith('.zip'):
-        root = zipfile.ZipFile(uri)
-        return ZipPrundle.from_root(root, pkg_name, meta)
+        return ZipPrundle.from_path(uri, pkg_name, meta)
     if not isdir(uri):
         PrundleError('I thought you were going to give me a directory')
-    return PathPrundle.from_root(uri, pkg_name, meta)
+    return PathPrundle.from_path(uri, pkg_name, meta)
 
